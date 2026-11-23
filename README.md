@@ -140,12 +140,13 @@ rad, where the wheels alone would give 3.3. The pose is the point on the
 circle of radius 1.67 m that a heading of three radians reaches.
 
 The example takes the wheel speed and turn rate as plain numbers. A program
-that has [odometry-nv](https://novo-lang.org/packages/odometry-nv) turns its
-encoder counts into exactly those two numbers with the `odometer` module's
-twist, and this package does not depend on it: a filter that fuses a twist
-needs no knowledge of how the twist was measured. A program on a
-microcontroller replaces `math.sin` and `math.cos` with the single-precision
-ones of [ahrs-nv](https://novo-lang.org/packages/ahrs-nv), since the embedded
+that uses [odometry-nv](https://novo-lang.org/packages/odometry-nv) reads them
+from the `twist` of the `Odometer` that `odometry.update` answers, as `v` and
+`w`, and this package does not depend on it: a filter that fuses a twist needs
+no knowledge of how the twist was measured, and an odometer needs none of the
+filter. A program on a microcontroller replaces `math.sin` and `math.cos` with
+the single-precision ones of [ahrs-nv](https://novo-lang.org/packages/ahrs-nv)
+(`fpmath.sin`, `fpmath.cos`) or of odometry-nv (`odotrig`), since the embedded
 tier refuses a call into the host's maths library.
 
 Build and test with `novo pkg build` and `novo test`.
