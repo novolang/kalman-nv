@@ -1,0 +1,105 @@
+// embedded_probe.nv — this package's device claim, as a program that
+// either builds for a Cortex-M or does not.
+//
+// It is not a test.  `scripts/shard_audit.sh`'s `core-embedded` row
+// copies it and the modules it names into a package of its own and
+// runs
+//
+//   novo build --target=nrf52-qemu src/probe.nv
+//
+// which produces a real Cortex-M4 ELF or fails.  `--target=nrf52-qemu`
+// stamps `@tier(embedded)` on every function it compiles, so the build
+// refuses an allocation, a list literal, an unbounded `while` and a
+// libm call wherever one is.
+//
+// WHAT THE CLAIM COVERS: every module of the package, built through the
+// functions below.  `kfmat.vec_of` and `kfmat.from_list` take a list and
+// carry `@tier(app)`: they are the host's way in and the device does not
+// call them.  The probe drives a constant-velocity filter with a
+// position sensor, which is the first thing a firmware does with this
+// package, through the matrix update, the scalar update, the gate and
+// the extended form, and folds every answer into one number so a single
+// comparison decides the run.
+
+use kalman
+use ekf
+use kfmat
+
+// The step of the constant-velocity model: position and velocity, with
+// the position measured.
+@tier(embedded)
+fn model(dt: fp32) -> Mat
+    var f = kfmat.identity(2)
+    f = kfmat.set(f, 0, 1, dt)
+    f
+
+@tier(embedded)
+fn score() -> Int
+    var n = 0
+    let dt: fp32 = 0.1
+    let f = model(dt)
+    let q = kfmat.diagonal(2, 0.001)
+    let h = kfmat.set(kfmat.zeros(1, 2), 0, 0, 1.0)
+    let r = kfmat.diagonal(1, 0.25)
+    var k = kalman.filter(kfmat.vec2(0.0, 0.0), kfmat.diagonal(2, 10.0))
+    if kalman.dim(k) == 2
+        n = n + 1
+
+    // Eight steps of a target moving at 1 m/s, measured at its position.
+    for i in 0..8
+        k = kalman.predict(k, f, q)
+        let z = kfmat.vec1(dt * (i + 1) as fp32)
+        let inn = kalman.innovate(k, z, h, r)
+        if kalman.gate(inn, 6.63)
+            k = kalman.update(k, z, h, r)
+    if kalman.fault(k) == KF_OK
+        n = n + 1
+    if kalman.state(k).a[1] > 0.5
+        n = n + 1
+    if kalman.nis(k) >= 0.0
+        n = n + 1
+    if kfmat.get(kalman.innovation_cov(k), 0, 0) > 0.0
+        if kalman.innovation(k).n == 1
+            n = n + 1
+
+    // The scalar update, and the vector measurement as scalars.
+    var s = kalman.update_scalar(k, 0.9, kfmat.vec2(1.0, 0.0), 0.25)
+    s = kalman.update_each(s, kfmat.vec1(0.9), h, kfmat.vec1(0.25))
+    if kalman.check(s) == KF_OK
+        n = n + 1
+    if kfmat.get(kalman.covariance(s), 0, 0) < kfmat.get(kalman.covariance(k), 0, 0)
+        n = n + 1
+    let input = kalman.predict_input(s, f, q, kfmat.vec2(0.0, 0.0))
+    if input.n == 2
+        n = n + 1
+
+    // The extended form: a state squared, measured.
+    var e = kalman.filter(kfmat.vec1(2.0), kfmat.diagonal(1, 1.0))
+    e = ekf.predict(e, kfmat.vec1(2.0), kfmat.identity(1), kfmat.diagonal(1, 0.01))
+    let hx = kfmat.vec1(4.0)
+    let hj = kfmat.diagonal(1, 4.0)
+    let einn = ekf.innovate(e, kfmat.vec1(4.2), hx, hj, kfmat.diagonal(1, 0.1))
+    if einn.ok
+        n = n + 1
+    e = ekf.update(e, kfmat.vec1(4.2), hx, hj, kfmat.diagonal(1, 0.1))
+    e = ekf.update_scalar(e, 4.2, 4.0, kfmat.vec1(4.0), 0.1)
+    let sinn = ekf.innovate_scalar(e, 4.2, 4.0, kfmat.vec1(4.0), 0.1)
+    if sinn.ok
+        n = n + 1
+    if kalman.fault(e) == KF_OK
+        n = n + 1
+    n
+
+@tier(rt)
+fn main() [hw, time]
+    bsp.board.init()
+    // 11 is the number of checks `score` makes on the path a linked
+    // build takes.  A mismatch prints FAIL, and the device's count is
+    // what a bisect starts from.
+    let n = score()
+    if n == 11
+        hal.uart.write("PASS: kalman-embedded\n")
+    else
+        hal.uart.write("FAIL: kalman-embedded\n")
+    loop
+        core.rt.sleep_ms(1000)

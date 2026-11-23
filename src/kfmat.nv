@@ -1,0 +1,759 @@
+// kfmat — the small dense matrices and vectors a Kalman filter works on.
+//
+// THE SIZE IS A CONSTANT OF THE BUILD.  `MAX_DIM` is the most rows or
+// columns a matrix here may have, and every matrix is a `Vec[fp32;
+// MAX_DIM * MAX_DIM]`, which lives in the frame of the function that
+// holds it.  Nothing in this package reaches the allocator: a filter
+// is a value, a step answers a value, and a firmware image links no
+// heap for it.  A matrix carries its own `r` and `c`, so one build
+// serves a two-state filter and a six-state one; what a build fixes
+// is the capacity, and a matrix asked to exceed it stops the program
+// with a message rather than writing past the storage.
+//
+// WHY THESE ROUTINES ARE HERE AND NOT linalg-nv'S.  linalg-nv's matrix
+// is an `NdFloat`, a heap value in `Float`, and a device build with no
+// allocator refuses the list literals that build one.  The filter needs
+// five operations on matrices of at most six rows, so they are written
+// out over inline storage, in `fp32`, and tested against numpy.
+//
+// A matrix is stored row-major and dense: element `(i, j)` of an
+// `r`-by-`c` matrix is `a[i * c + j]`, and the `Vec` holds exactly
+// `r * c` elements.
+
+// The most rows or columns a matrix or vector may have in this build.
+pub const MAX_DIM = 6
+
+// The capacity of a matrix, in elements.
+pub const CELLS = MAX_DIM * MAX_DIM
+
+// A column vector of at most `MAX_DIM` elements.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let v = kfmat.vec2(3.0, 4.0)
+//     println("${v.n}")   // 2
+// ```
+pub @value
+struct KVec
+    // How many elements the vector holds.
+    n: Int
+    // The elements, `n` of them.
+    a: Vec[fp32; MAX_DIM]
+
+// A matrix of at most `MAX_DIM` by `MAX_DIM`.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let m = kfmat.identity(3)
+//     println("${m.r} ${m.c}")   // 3 3
+// ```
+pub @value
+struct Mat
+    // Rows.
+    r: Int
+    // Columns.
+    c: Int
+    // The elements, row-major, `r * c` of them.
+    a: Vec[fp32; CELLS]
+
+// ── Construction ─────────────────────────────────────────────────────
+
+// The zero vector of `n` elements.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     println("${kfmat.vzeros(3).n}")   // 3
+// ```
+pub fn vzeros(n: Int) -> KVec []
+    if n < 0 or n > MAX_DIM
+        panic.panic("kfmat.vzeros: the length is outside 0..MAX_DIM")
+    var a: Vec[fp32; MAX_DIM] = Vec.new()
+    for i in 0..n
+        a.push(0.0)
+    KVec { n: n, a: a }
+
+// A vector of one element.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     println("${kfmat.vec1(2.5).a[0]}")   // 2.5
+// ```
+pub fn vec1(x: fp32) -> KVec []
+    var v = vzeros(1)
+    v.a[0] = x
+    v
+
+// A vector of two elements.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     println("${kfmat.vec2(1.0, 2.0).a[1]}")   // 2
+// ```
+pub fn vec2(x: fp32, y: fp32) -> KVec []
+    var v = vzeros(2)
+    v.a[0] = x
+    v.a[1] = y
+    v
+
+// A vector of three elements.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     println("${kfmat.vec3(1.0, 2.0, 3.0).a[2]}")   // 3
+// ```
+pub fn vec3(x: fp32, y: fp32, z: fp32) -> KVec []
+    var v = vzeros(3)
+    v.a[0] = x
+    v.a[1] = y
+    v.a[2] = z
+    v
+
+// A vector of four elements.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     println("${kfmat.vec4(1.0, 2.0, 3.0, 4.0).a[3]}")   // 4
+// ```
+pub fn vec4(x: fp32, y: fp32, z: fp32, w: fp32) -> KVec []
+    var v = vzeros(4)
+    v.a[0] = x
+    v.a[1] = y
+    v.a[2] = z
+    v.a[3] = w
+    v
+
+// A vector from a list of `Float`.  This is the host's way in: a list
+// allocates, so a device builds its vectors with `vzeros` and `vset`.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let v = kfmat.vec_of([1.0, 2.0, 3.0])
+//     println("${v.n} ${v.a[1]}")   // 3 2
+// ```
+pub @tier(app)
+fn vec_of(xs: [Float]) -> KVec []
+    var v = vzeros(list.len(xs))
+    for i in 0..v.n
+        v.a[i] = xs[i] as fp32
+    v
+
+// The zero matrix of `r` rows and `c` columns.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let m = kfmat.zeros(2, 3)
+//     println("${m.r} ${m.c} ${m.a[5]}")   // 2 3 0
+// ```
+pub @wrapping
+fn zeros(r: Int, c: Int) -> Mat []
+    if r < 0 or c < 0 or r > MAX_DIM or c > MAX_DIM
+        panic.panic("kfmat.zeros: a dimension is outside 0..MAX_DIM")
+    var a: Vec[fp32; CELLS] = Vec.new()
+    for i in 0..r * c
+        a.push(0.0)
+    Mat { r: r, c: c, a: a }
+
+// The identity matrix of `n` rows and columns.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let m = kfmat.identity(2)
+//     println("${m.a[0]} ${m.a[1]} ${m.a[3]}")   // 1 0 1
+// ```
+pub @wrapping
+fn identity(n: Int) -> Mat []
+    var m = zeros(n, n)
+    for i in 0..n
+        m.a[i * n + i] = 1.0
+    m
+
+// A diagonal matrix with `d` on its diagonal.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let m = kfmat.diagonal(2, 0.5)
+//     println("${m.a[0]} ${m.a[1]} ${m.a[3]}")   // 0.5 0 0.5
+// ```
+pub @wrapping
+fn diagonal(n: Int, d: fp32) -> Mat []
+    var m = zeros(n, n)
+    for i in 0..n
+        m.a[i * n + i] = d
+    m
+
+// A matrix from a list of `Float`, row-major.  The host's way in, as
+// `vec_of` is for a vector.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let m = kfmat.from_list(2, 2, [1.0, 2.0, 3.0, 4.0])
+//     println("${kfmat.get(m, 1, 0)}")   // 3
+// ```
+pub @tier(app)
+fn from_list(r: Int, c: Int, xs: [Float]) -> Mat []
+    if list.len(xs) != r * c
+        panic.panic("kfmat.from_list: the list is not rows times columns long")
+    var m = zeros(r, c)
+    for i in 0..r * c
+        m.a[i] = xs[i] as fp32
+    m
+
+// ── Reading and writing ──────────────────────────────────────────────
+
+// Element `i` of a vector.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     println("${kfmat.vget(kfmat.vec2(5.0, 6.0), 1)}")   // 6
+// ```
+pub fn vget(v: KVec, i: Int) -> fp32 []
+    v.a[i]
+
+// The vector with element `i` replaced.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let v = kfmat.vset(kfmat.vec2(5.0, 6.0), 0, 9.0)
+//     println("${v.a[0]}")   // 9
+// ```
+pub fn vset(v: KVec, i: Int, x: fp32) -> KVec []
+    var out = v
+    out.a[i] = x
+    out
+
+// Element `(i, j)` of a matrix.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     println("${kfmat.get(kfmat.identity(2), 1, 1)}")   // 1
+// ```
+pub @wrapping
+fn get(m: Mat, i: Int, j: Int) -> fp32 []
+    m.a[i * m.c + j]
+
+// The matrix with element `(i, j)` replaced.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let m = kfmat.set(kfmat.identity(2), 0, 1, 7.0)
+//     println("${kfmat.get(m, 0, 1)}")   // 7
+// ```
+pub @wrapping
+fn set(m: Mat, i: Int, j: Int, x: fp32) -> Mat []
+    var out = m
+    out.a[i * m.c + j] = x
+    out
+
+// ── Vectors ──────────────────────────────────────────────────────────
+
+// The sum of two vectors of the same length.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let s = kfmat.vadd(kfmat.vec2(1.0, 2.0), kfmat.vec2(10.0, 20.0))
+//     println("${s.a[0]} ${s.a[1]}")   // 11 22
+// ```
+pub fn vadd(x: KVec, y: KVec) -> KVec []
+    if x.n != y.n
+        panic.panic("kfmat.vadd: the lengths differ")
+    var out = x
+    for i in 0..x.n
+        out.a[i] = x.a[i] + y.a[i]
+    out
+
+// The difference of two vectors of the same length.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let d = kfmat.vsub(kfmat.vec2(5.0, 5.0), kfmat.vec2(1.0, 2.0))
+//     println("${d.a[0]} ${d.a[1]}")   // 4 3
+// ```
+pub fn vsub(x: KVec, y: KVec) -> KVec []
+    if x.n != y.n
+        panic.panic("kfmat.vsub: the lengths differ")
+    var out = x
+    for i in 0..x.n
+        out.a[i] = x.a[i] - y.a[i]
+    out
+
+// A vector scaled by `k`.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let s = kfmat.vscale(kfmat.vec2(1.0, 2.0), 3.0)
+//     println("${s.a[1]}")   // 6
+// ```
+pub fn vscale(x: KVec, k: fp32) -> KVec []
+    var out = x
+    for i in 0..x.n
+        out.a[i] = x.a[i] * k
+    out
+
+// The dot product of two vectors of the same length.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     println("${kfmat.dot(kfmat.vec2(1.0, 2.0), kfmat.vec2(3.0, 4.0))}")   // 11
+// ```
+pub fn dot(x: KVec, y: KVec) -> fp32 []
+    if x.n != y.n
+        panic.panic("kfmat.dot: the lengths differ")
+    var s: fp32 = 0.0
+    for i in 0..x.n
+        s = s + x.a[i] * y.a[i]
+    s
+
+// ── Matrices ─────────────────────────────────────────────────────────
+
+// The transpose.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let t = kfmat.transpose(kfmat.from_list(1, 2, [1.0, 2.0]))
+//     println("${t.r} ${t.c}")   // 2 1
+// ```
+pub @wrapping
+fn transpose(m: Mat) -> Mat []
+    var out = zeros(m.c, m.r)
+    for i in 0..m.r
+        for j in 0..m.c
+            out.a[j * m.r + i] = m.a[i * m.c + j]
+    out
+
+// The sum of two matrices of the same shape.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let s = kfmat.add(kfmat.identity(2), kfmat.identity(2))
+//     println("${kfmat.get(s, 1, 1)}")   // 2
+// ```
+pub @wrapping
+fn add(x: Mat, y: Mat) -> Mat []
+    if x.r != y.r or x.c != y.c
+        panic.panic("kfmat.add: the shapes differ")
+    var out = x
+    for i in 0..x.r * x.c
+        out.a[i] = x.a[i] + y.a[i]
+    out
+
+// The difference of two matrices of the same shape.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let d = kfmat.sub(kfmat.diagonal(2, 3.0), kfmat.identity(2))
+//     println("${kfmat.get(d, 0, 0)}")   // 2
+// ```
+pub @wrapping
+fn sub(x: Mat, y: Mat) -> Mat []
+    if x.r != y.r or x.c != y.c
+        panic.panic("kfmat.sub: the shapes differ")
+    var out = x
+    for i in 0..x.r * x.c
+        out.a[i] = x.a[i] - y.a[i]
+    out
+
+// A matrix scaled by `k`.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let s = kfmat.scale(kfmat.identity(2), 4.0)
+//     println("${kfmat.get(s, 1, 1)}")   // 4
+// ```
+pub @wrapping
+fn scale(m: Mat, k: fp32) -> Mat []
+    var out = m
+    for i in 0..m.r * m.c
+        out.a[i] = m.a[i] * k
+    out
+
+// The product `x * y` of an `r`-by-`k` and a `k`-by-`c` matrix.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let a = kfmat.from_list(2, 2, [1.0, 2.0, 3.0, 4.0])
+//     let p = kfmat.mul(a, a)
+//     println("${kfmat.get(p, 0, 0)} ${kfmat.get(p, 1, 1)}")   // 7 22
+// ```
+pub @wrapping
+fn mul(x: Mat, y: Mat) -> Mat []
+    if x.c != y.r
+        panic.panic("kfmat.mul: the inner dimensions differ")
+    var out = zeros(x.r, y.c)
+    for i in 0..x.r
+        for j in 0..y.c
+            var s: fp32 = 0.0
+            for k in 0..x.c
+                s = s + x.a[i * x.c + k] * y.a[k * y.c + j]
+            out.a[i * y.c + j] = s
+    out
+
+// The product `x * yᵀ`, which is what a covariance carried through a
+// linear map needs and what saves building a transpose.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let a = kfmat.from_list(1, 2, [1.0, 2.0])
+//     let p = kfmat.mul_t(a, a)
+//     println("${kfmat.get(p, 0, 0)}")   // 5
+// ```
+pub @wrapping
+fn mul_t(x: Mat, y: Mat) -> Mat []
+    if x.c != y.c
+        panic.panic("kfmat.mul_t: the column counts differ")
+    var out = zeros(x.r, y.r)
+    for i in 0..x.r
+        for j in 0..y.r
+            var s: fp32 = 0.0
+            for k in 0..x.c
+                s = s + x.a[i * x.c + k] * y.a[j * y.c + k]
+            out.a[i * y.r + j] = s
+    out
+
+// The product of a matrix and a vector.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let a = kfmat.from_list(2, 2, [1.0, 2.0, 3.0, 4.0])
+//     let y = kfmat.mul_vec(a, kfmat.vec2(1.0, 1.0))
+//     println("${y.a[0]} ${y.a[1]}")   // 3 7
+// ```
+pub @wrapping
+fn mul_vec(m: Mat, x: KVec) -> KVec []
+    if m.c != x.n
+        panic.panic("kfmat.mul_vec: the matrix has a different column count than the vector has elements")
+    var out = vzeros(m.r)
+    for i in 0..m.r
+        var s: fp32 = 0.0
+        for k in 0..m.c
+            s = s + m.a[i * m.c + k] * x.a[k]
+        out.a[i] = s
+    out
+
+// The product of a transposed matrix and a vector, `mᵀ x`.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let a = kfmat.from_list(2, 2, [1.0, 2.0, 3.0, 4.0])
+//     let y = kfmat.mul_t_vec(a, kfmat.vec2(1.0, 1.0))
+//     println("${y.a[0]} ${y.a[1]}")   // 4 6
+// ```
+pub @wrapping
+fn mul_t_vec(m: Mat, x: KVec) -> KVec []
+    if m.r != x.n
+        panic.panic("kfmat.mul_t_vec: the matrix has a different row count than the vector has elements")
+    var out = vzeros(m.c)
+    for j in 0..m.c
+        var s: fp32 = 0.0
+        for k in 0..m.r
+            s = s + m.a[k * m.c + j] * x.a[k]
+        out.a[j] = s
+    out
+
+// A vector as a matrix of one column.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let c = kfmat.column(kfmat.vec3(1.0, 2.0, 3.0))
+//     println("${c.r} ${c.c}")   // 3 1
+// ```
+pub fn column(v: KVec) -> Mat []
+    var m = zeros(v.n, 1)
+    for i in 0..v.n
+        m.a[i] = v.a[i]
+    m
+
+// A vector as a matrix of one row.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let r = kfmat.row(kfmat.vec3(1.0, 2.0, 3.0))
+//     println("${r.r} ${r.c}")   // 1 3
+// ```
+pub fn row(v: KVec) -> Mat []
+    var m = zeros(1, v.n)
+    for i in 0..v.n
+        m.a[i] = v.a[i]
+    m
+
+// Row `i` of a matrix as a vector.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let v = kfmat.row_of(kfmat.from_list(2, 2, [1.0, 2.0, 3.0, 4.0]), 1)
+//     println("${v.a[0]} ${v.a[1]}")   // 3 4
+// ```
+pub @wrapping
+fn row_of(m: Mat, i: Int) -> KVec []
+    var v = vzeros(m.c)
+    for j in 0..m.c
+        v.a[j] = m.a[i * m.c + j]
+    v
+
+// The first column of a matrix as a vector.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let v = kfmat.first_column(kfmat.from_list(2, 2, [1.0, 2.0, 3.0, 4.0]))
+//     println("${v.a[0]} ${v.a[1]}")   // 1 3
+// ```
+pub @wrapping
+fn first_column(m: Mat) -> KVec []
+    var v = vzeros(m.r)
+    for i in 0..m.r
+        v.a[i] = m.a[i * m.c]
+    v
+
+// The trace: the sum of the diagonal of a square matrix.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     println("${kfmat.trace(kfmat.diagonal(3, 2.0))}")   // 6
+// ```
+pub @wrapping
+fn trace(m: Mat) -> fp32 []
+    if m.r != m.c
+        panic.panic("kfmat.trace: the matrix is not square")
+    var s: fp32 = 0.0
+    for i in 0..m.r
+        s = s + m.a[i * m.c + i]
+    s
+
+// ── Symmetry and definiteness ────────────────────────────────────────
+
+// The largest `|m(i,j) - m(j,i)|` of a square matrix: how far it is
+// from symmetric.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let m = kfmat.from_list(2, 2, [1.0, 2.0, 2.5, 1.0])
+//     println("${kfmat.asymmetry(m)}")   // 0.5
+// ```
+pub @wrapping
+fn asymmetry(m: Mat) -> fp32 []
+    if m.r != m.c
+        panic.panic("kfmat.asymmetry: the matrix is not square")
+    let zero: fp32 = 0.0
+    var worst = zero
+    for i in 0..m.r
+        for j in i + 1..m.c
+            let u = m.a[i * m.c + j]
+            let l = m.a[j * m.c + i]
+            let hi = if u > l
+                u
+            else
+                l
+            let lo = if u > l
+                l
+            else
+                u
+            let ad = hi - lo
+            worst = if ad > worst
+                ad
+            else
+                worst
+    worst
+
+// Whether a square matrix is symmetric to within `tol` in every pair
+// of mirrored elements.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     println("${kfmat.is_symmetric(kfmat.identity(3), 0.0)}")   // true
+// ```
+pub fn is_symmetric(m: Mat, tol: fp32) -> Bool []
+    asymmetry(m) <= tol
+
+// The nearest symmetric matrix: `(m + mᵀ) / 2`.  A covariance that has
+// drifted off symmetry by rounding is put back with this.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let m = kfmat.symmetrize(kfmat.from_list(2, 2, [1.0, 2.0, 4.0, 1.0]))
+//     println("${kfmat.get(m, 0, 1)} ${kfmat.get(m, 1, 0)}")   // 3 3
+// ```
+pub @wrapping
+fn symmetrize(m: Mat) -> Mat []
+    if m.r != m.c
+        panic.panic("kfmat.symmetrize: the matrix is not square")
+    var out = m
+    let half: fp32 = 0.5
+    for i in 0..m.r
+        for j in i + 1..m.c
+            let s = (m.a[i * m.c + j] + m.a[j * m.c + i]) * half
+            out.a[i * m.c + j] = s
+            out.a[j * m.c + i] = s
+    out
+
+// The factorisation `m = L D Lᵀ` of a symmetric matrix, with `L` unit
+// lower triangular, packed into one matrix: the strict lower triangle
+// is `L`, the diagonal is `D`.  The upper triangle is left as it was.
+// `m` is read through its lower triangle only.
+//
+// No square root is taken, which is why this and not Cholesky is the
+// factorisation here: the root is a libm call the embedded tier
+// refuses, and `D` is all a definiteness test and a solve need.
+pub @wrapping
+fn ldl(m: Mat) -> Mat []
+    if m.r != m.c
+        panic.panic("kfmat.ldl: the matrix is not square")
+    var f = m
+    let n = m.r
+    let zero: fp32 = 0.0
+    for j in 0..n
+        var d = m.a[j * n + j]
+        for k in 0..j
+            let l = f.a[j * n + k]
+            d = d - l * l * f.a[k * n + k]
+        f.a[j * n + j] = d
+        for i in j + 1..n
+            var s = m.a[i * n + j]
+            for k in 0..j
+                s = s - f.a[i * n + k] * f.a[j * n + k] * f.a[k * n + k]
+            if d != zero
+                f.a[i * n + j] = s / d
+            else
+                f.a[i * n + j] = zero
+    f
+
+// Whether a symmetric matrix is positive definite: every pivot of its
+// `L D Lᵀ` factorisation exceeds `eps` times the largest diagonal
+// element.  `eps` is the relative floor under which a pivot counts as
+// zero; `1.0e-6` is a sound value in `fp32`.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     println("${kfmat.is_positive_definite(kfmat.identity(3), 0.000001)}")   // true
+// ```
+pub @wrapping
+fn is_positive_definite(m: Mat, eps: fp32) -> Bool []
+    if m.r != m.c
+        panic.panic("kfmat.is_positive_definite: the matrix is not square")
+    let zero: fp32 = 0.0
+    var big = zero
+    for i in 0..m.r
+        let d = m.a[i * m.c + i]
+        big = if d > big
+            d
+        else
+            big
+    if big <= zero
+        return false
+    let f = ldl(m)
+    var ok = true
+    for i in 0..m.r
+        if f.a[i * m.c + i] <= eps * big
+            ok = false
+    ok
+
+// The solution `X` of `s X = b` for a symmetric positive definite
+// `s`, by the `L D Lᵀ` factors of `s`.  `b` may have several columns.
+// The caller has already checked `s` with `is_positive_definite`; a
+// zero pivot divides to infinity here as it would anywhere.
+//
+// ```novo
+// use kfmat
+//
+// fn main() [io]
+//     let s = kfmat.from_list(2, 2, [4.0, 0.0, 0.0, 2.0])
+//     let x = kfmat.solve_spd(s, kfmat.from_list(2, 1, [8.0, 8.0]))
+//     println("${kfmat.get(x, 0, 0)} ${kfmat.get(x, 1, 0)}")   // 2 4
+// ```
+pub @wrapping
+fn solve_spd(s: Mat, b: Mat) -> Mat []
+    if s.r != s.c or s.r != b.r
+        panic.panic("kfmat.solve_spd: the shapes do not match")
+    let f = ldl(s)
+    let n = s.r
+    var x = b
+    for col in 0..b.c
+        // Forward: L y = b.
+        for i in 0..n
+            var t = x.a[i * b.c + col]
+            for k in 0..i
+                t = t - f.a[i * n + k] * x.a[k * b.c + col]
+            x.a[i * b.c + col] = t
+        // Diagonal: D z = y.
+        for i in 0..n
+            x.a[i * b.c + col] = x.a[i * b.c + col] / f.a[i * n + i]
+        // Backward: Lᵀ x = z.
+        for step in 0..n
+            let i = n - 1 - step
+            var t = x.a[i * b.c + col]
+            for k in i + 1..n
+                t = t - f.a[k * n + i] * x.a[k * b.c + col]
+            x.a[i * b.c + col] = t
+    x

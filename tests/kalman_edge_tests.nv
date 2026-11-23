@@ -1,0 +1,224 @@
+// kalman_edge_tests.nv — the filter's own contracts: the fault codes, the
+// refusal of an update that has no gain, the gate, the control input, the
+// Joseph form's hold on the covariance over thousands of steps, and the
+// dimension checks that stop the program.
+//
+// The vector tests compare the filters with a reference filter; these
+// are the cases a reference does not have, because a reference filter
+// does not carry a fault code.
+
+use std.test
+use kfmat
+use kalman
+use ekf
+
+fn unit_filter() -> Kf
+    kalman.filter(kfmat.vec1(0.0), kfmat.diagonal(1, 4.0))
+
+fn cv_filter() -> Kf
+    kalman.filter(kfmat.vec2(0.0, 0.0), kfmat.diagonal(2, 1.0))
+
+// ── The covariance check ─────────────────────────────────────────────
+
+@test
+fn test_a_fresh_filter_with_a_good_covariance_reports_no_fault()
+    let k = cv_filter()
+    test.assert_eq(kalman.dim(k), 2)
+    test.assert_eq(kalman.fault(k), KF_OK)
+    test.assert_eq(kalman.check(k), KF_OK)
+    test.assert_eq(kalman.state(k).n, 2)
+    test.assert_eq(kfmat.get(kalman.covariance(k), 1, 1), 1.0)
+
+@test
+fn test_a_covariance_with_a_nan_or_an_infinity_is_not_finite()
+    let nan = 0.0 / 0.0
+    let inf = 1.0 / 0.0
+    let in_p = kalman.filter(kfmat.vec1(0.0), kfmat.diagonal(1, nan as fp32))
+    test.assert_eq(kalman.fault(in_p), KF_NOT_FINITE)
+    let in_x = kalman.filter(kfmat.vec1(inf as fp32), kfmat.diagonal(1, 1.0))
+    test.assert_eq(kalman.fault(in_x), KF_NOT_FINITE)
+
+@test
+fn test_a_covariance_that_is_not_its_own_transpose_is_not_symmetric()
+    let p = kfmat.from_list(2, 2, [1.0, 0.5, 0.0, 1.0])
+    let k = kalman.filter(kfmat.vec2(0.0, 0.0), p)
+    test.assert_eq(kalman.fault(k), KF_NOT_SYMMETRIC)
+
+@test
+fn test_a_covariance_with_a_negative_eigenvalue_is_not_positive()
+    let k = kalman.filter(kfmat.vec2(0.0, 0.0), kfmat.from_list(2, 2, [1.0, 2.0, 2.0, 1.0]))
+    test.assert_eq(kalman.fault(k), KF_NOT_POSITIVE)
+    let neg = kalman.filter(kfmat.vec1(0.0), kfmat.diagonal(1, -1.0))
+    test.assert_eq(kalman.check(neg), KF_NOT_POSITIVE)
+
+@test
+fn test_the_symmetry_tolerance_scales_with_the_covariance()
+    // The same one-part-in-a-million asymmetry is noise at the scale of a
+    // million and a fault at the scale of one.
+    let big = kfmat.from_list(2, 2, [1000000.0, 1.0, 0.0, 1000000.0])
+    test.assert_eq(kalman.fault(kalman.filter(kfmat.vec2(0.0, 0.0), big)), KF_OK)
+    let small = kfmat.from_list(2, 2, [1.0, 0.001, 0.0, 1.0])
+    test.assert_eq(kalman.fault(kalman.filter(kfmat.vec2(0.0, 0.0), small)), KF_NOT_SYMMETRIC)
+
+// ── An update with no gain is refused ────────────────────────────────
+
+@test
+fn test_an_update_whose_innovation_covariance_is_singular_changes_nothing()
+    // H = 0 and R = 0: S is zero, so there is no gain.
+    let k = cv_filter()
+    let h = kfmat.zeros(1, 2)
+    let r = kfmat.zeros(1, 1)
+    let k2 = kalman.update(k, kfmat.vec1(5.0), h, r)
+    test.assert_eq(kalman.fault(k2), KF_SINGULAR_INNOVATION)
+    test.assert_eq(kalman.state(k2).a[0], 0.0)
+    test.assert_eq(kfmat.get(kalman.covariance(k2), 0, 0), 1.0)
+    test.assert(not kalman.innovate(k, kfmat.vec1(5.0), h, r).ok)
+    test.assert_eq(kalman.nis(k2), 0.0)
+    test.assert_eq(kalman.innovation(k2).a[0], 5.0)
+
+@test
+fn test_a_scalar_update_with_no_variance_and_no_sensitivity_is_refused()
+    let k = cv_filter()
+    let k2 = kalman.update_scalar(k, 5.0, kfmat.vec2(0.0, 0.0), 0.0)
+    test.assert_eq(kalman.fault(k2), KF_SINGULAR_INNOVATION)
+    test.assert_eq(kalman.state(k2).a[0], 0.0)
+    test.assert(not kalman.innovate_scalar(k, 5.0, kfmat.vec2(0.0, 0.0), 0.0).ok)
+
+@test
+fn test_update_each_stops_at_the_component_that_has_no_gain()
+    // The first row of H is zero and its variance is zero, so it has no
+    // gain; the second is sound.  The loop stops at the first, so the
+    // second is never applied and the code is the first's.
+    let h = kfmat.from_list(2, 2, [0.0, 0.0, 1.0, 0.0])
+    let k2 = kalman.update_each(cv_filter(), kfmat.vec2(7.0, 1.0), h, kfmat.vec2(0.0, 0.0))
+    test.assert_eq(kalman.fault(k2), KF_SINGULAR_INNOVATION)
+    test.assert_eq(kalman.state(k2).a[0], 0.0)
+    test.assert_eq(kfmat.get(kalman.covariance(k2), 0, 0), 1.0)
+
+// ── Gating ───────────────────────────────────────────────────────────
+
+@test
+fn test_the_gate_passes_a_consistent_measurement_and_rejects_an_outlier()
+    let k = unit_filter()
+    let h = kfmat.identity(1)
+    let r = kfmat.diagonal(1, 1.0)
+    // S = 4 + 1 = 5.  A measurement of 2 gives 4/5 = 0.8; one of 10 gives 20.
+    let near = kalman.innovate(k, kfmat.vec1(2.0), h, r)
+    test.assert_approx(near.nis as Float, 0.8, 0.000001)
+    test.assert_approx(kfmat.get(near.s, 0, 0) as Float, 5.0, 0.000001)
+    test.assert(kalman.gate(near, 3.84))
+    let far = kalman.innovate(k, kfmat.vec1(10.0), h, r)
+    test.assert_approx(far.nis as Float, 20.0, 0.00001)
+    test.assert(not kalman.gate(far, 3.84))
+
+@test
+fn test_a_measurement_with_no_gain_never_passes_the_gate()
+    let inn = kalman.innovate(unit_filter(), kfmat.vec1(0.0), kfmat.zeros(1, 1), kfmat.zeros(1, 1))
+    test.assert(not kalman.gate(inn, 1000000.0))
+
+@test
+fn test_an_applied_update_leaves_the_innovation_it_acted_on()
+    let k = kalman.update(unit_filter(), kfmat.vec1(2.0), kfmat.identity(1), kfmat.diagonal(1, 1.0))
+    test.assert_eq(kalman.innovation(k).a[0], 2.0)
+    test.assert_approx(kfmat.get(kalman.innovation_cov(k), 0, 0) as Float, 5.0, 0.000001)
+    test.assert_approx(kalman.nis(k) as Float, 0.8, 0.000001)
+    // The gain is 4/5, so the state is 1.6 and the variance 4 * 1 / 5.
+    test.assert_approx(kalman.state(k).a[0] as Float, 1.6, 0.000001)
+    test.assert_approx(kfmat.get(kalman.covariance(k), 0, 0) as Float, 0.8, 0.000001)
+
+@test
+fn test_the_shared_update_takes_the_predicted_measurement_the_caller_evaluated()
+    // x = 0 and P = 4, but the model's own value at x is 1: the
+    // innovation is 5 - 1 = 4, S = 5, the gain 0.8, so x = 3.2.
+    let k = kalman.correct(unit_filter(), kfmat.vec1(5.0), kfmat.vec1(1.0), kfmat.identity(1), kfmat.diagonal(1, 1.0))
+    test.assert_eq(kalman.innovation(k).a[0], 4.0)
+    test.assert_approx(kalman.state(k).a[0] as Float, 3.2, 0.000001)
+    test.assert_approx(kfmat.get(kalman.covariance(k), 0, 0) as Float, 0.8, 0.000001)
+
+@test
+fn test_the_shared_scalar_update_agrees_with_the_matrix_form_on_one_measurement()
+    let matrix = kalman.correct(unit_filter(), kfmat.vec1(5.0), kfmat.vec1(1.0), kfmat.identity(1), kfmat.diagonal(1, 1.0))
+    let scalar = kalman.correct_scalar(unit_filter(), 5.0, 1.0, kfmat.vec1(1.0), 1.0)
+    test.assert_approx(kalman.state(scalar).a[0] as Float, kalman.state(matrix).a[0] as Float, 0.000001)
+    test.assert_approx(kfmat.get(kalman.covariance(scalar), 0, 0) as Float,
+        kfmat.get(kalman.covariance(matrix), 0, 0) as Float,
+        0.000001)
+    test.assert_approx(kalman.nis(scalar) as Float, kalman.nis(matrix) as Float, 0.000001)
+
+// ── Prediction ───────────────────────────────────────────────────────
+
+@test
+fn test_a_prediction_moves_the_state_and_grows_the_covariance_by_q()
+    let k = kalman.filter(kfmat.vec2(0.0, 2.0), kfmat.diagonal(2, 1.0))
+    let f = kfmat.from_list(2, 2, [1.0, 0.5, 0.0, 1.0])
+    let k2 = kalman.predict(k, f, kfmat.diagonal(2, 0.25))
+    test.assert_eq(kalman.state(k2).a[0], 1.0)
+    test.assert_eq(kalman.state(k2).a[1], 2.0)
+    // F P Ft = [[1.25, 0.5], [0.5, 1]], plus Q on the diagonal.
+    test.assert_eq(kfmat.get(kalman.covariance(k2), 0, 0), 1.5)
+    test.assert_eq(kfmat.get(kalman.covariance(k2), 0, 1), 0.5)
+    test.assert_eq(kfmat.get(kalman.covariance(k2), 1, 1), 1.25)
+
+@test
+fn test_a_control_input_is_added_to_the_predicted_state()
+    let k = kalman.filter(kfmat.vec2(0.0, 2.0), kfmat.diagonal(2, 1.0))
+    let f = kfmat.from_list(2, 2, [1.0, 0.5, 0.0, 1.0])
+    let k2 = kalman.predict_input(k, f, kfmat.diagonal(2, 0.0), kfmat.vec2(0.0, 0.125))
+    test.assert_eq(kalman.state(k2).a[0], 1.0)
+    test.assert_eq(kalman.state(k2).a[1], 2.125)
+
+@test
+fn test_the_extended_prediction_takes_the_state_the_caller_computed()
+    let k = kalman.filter(kfmat.vec1(2.0), kfmat.diagonal(1, 1.0))
+    let k2 = ekf.predict(k, kfmat.vec1(4.0), kfmat.diagonal(1, 4.0), kfmat.diagonal(1, 0.5))
+    test.assert_eq(kalman.state(k2).a[0], 4.0)
+    test.assert_eq(kfmat.get(kalman.covariance(k2), 0, 0), 16.5)
+
+// ── The Joseph form holds the covariance over a long run ─────────────
+
+@test
+fn test_five_thousand_updates_leave_the_covariance_symmetric_and_positive()
+    // A measurement a million times more precise than the prior, on a
+    // two-state filter, five thousand times over: the case in which a
+    // covariance update is most exposed to rounding.
+    let f = kfmat.from_list(2, 2, [1.0, 0.01, 0.0, 1.0])
+    let q = kfmat.diagonal(2, 0.000001)
+    let h = kfmat.from_list(1, 2, [1.0, 0.0])
+    let r = kfmat.diagonal(1, 0.001)
+    var k = kalman.filter(kfmat.vec2(0.0, 0.0), kfmat.diagonal(2, 1000.0))
+    for i in 0..5000
+        k = kalman.predict(k, f, q)
+        k = kalman.update(k, kfmat.vec1(1.0), h, r)
+    test.assert_eq(kalman.fault(k), KF_OK)
+    test.assert(kfmat.is_symmetric(kalman.covariance(k), 0.0))
+    test.assert(kfmat.is_positive_definite(kalman.covariance(k), 0.000001))
+    test.assert_approx(kalman.state(k).a[0] as Float, 1.0, 0.01)
+
+// ── The dimension checks ─────────────────────────────────────────────
+
+fn two_state() -> Kf
+    cv_filter()
+
+fn f22() -> Mat
+    kfmat.identity(2)
+
+@test
+fn test_a_filter_built_with_the_wrong_covariance_shape_stops_the_program()
+    test.assert_raises(() => kalman.filter(kfmat.vec2(0.0, 0.0), kfmat.identity(3)))
+    test.assert_raises(() => kalman.filter(kfmat.vec2(0.0, 0.0), kfmat.zeros(2, 3)))
+
+@test
+fn test_a_step_with_the_wrong_shape_stops_the_program()
+    test.assert_raises(() => kalman.predict_to(two_state(), kfmat.vzeros(3), f22(), f22()))
+    test.assert_raises(() => kalman.predict_to(two_state(), kfmat.vzeros(2), kfmat.identity(3), f22()))
+    test.assert_raises(() => kalman.predict_to(two_state(), kfmat.vzeros(2), kfmat.zeros(2, 3), f22()))
+    test.assert_raises(() => kalman.predict_to(two_state(), kfmat.vzeros(2), f22(), kfmat.identity(3)))
+    test.assert_raises(() => kalman.predict_to(two_state(), kfmat.vzeros(2), f22(), kfmat.zeros(2, 3)))
+    test.assert_raises(() => kalman.innovate_with(two_state(), kfmat.vzeros(1), kfmat.vzeros(2), kfmat.zeros(1, 2), kfmat.zeros(1, 1)))
+    test.assert_raises(() => kalman.innovate_with(two_state(), kfmat.vzeros(1), kfmat.vzeros(1), kfmat.zeros(2, 2), kfmat.zeros(1, 1)))
+    test.assert_raises(() => kalman.innovate_with(two_state(), kfmat.vzeros(1), kfmat.vzeros(1), kfmat.zeros(1, 3), kfmat.zeros(1, 1)))
+    test.assert_raises(() => kalman.innovate_with(two_state(), kfmat.vzeros(1), kfmat.vzeros(1), kfmat.zeros(1, 2), kfmat.zeros(2, 2)))
+    test.assert_raises(() => kalman.innovate_with(two_state(), kfmat.vzeros(1), kfmat.vzeros(1), kfmat.zeros(1, 2), kfmat.zeros(1, 2)))
+    test.assert_raises(() => kalman.innovate_scalar_with(two_state(), 0.0, 0.0, kfmat.vzeros(3), 1.0))
+    test.assert_raises(() => kalman.update_each(two_state(), kfmat.vzeros(2), kfmat.zeros(1, 2), kfmat.vzeros(2)))
+    test.assert_raises(() => kalman.update_each(two_state(), kfmat.vzeros(2), kfmat.zeros(2, 2), kfmat.vzeros(1)))

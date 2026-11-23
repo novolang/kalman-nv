@@ -1,0 +1,251 @@
+// kfmat_tests.nv — the small matrix and vector routines the filters are
+// built on, against answers worked by hand.
+//
+// Every expected number is a product, a sum or a factor that can be
+// checked on paper: [[1,2,3],[4,5,6]] times [[7,8],[9,10],[11,12]] is
+// [[58,64],[139,154]], and [[4,2,2],[2,5,3],[2,3,6]] factors as L D Lt
+// with the strict lower triangle 0.5, 0.5, 0.5 and the diagonal 4, 4, 4.
+// The solve is compared with numpy's, whose values are written as
+// literals.
+
+use std.test
+use kfmat
+
+// ── Construction and reading ─────────────────────────────────────────
+
+@test
+fn test_a_zero_vector_and_a_zero_matrix_hold_zeros_of_the_requested_shape()
+    let v = kfmat.vzeros(3)
+    test.assert_eq(v.n, 3)
+    test.assert_eq(kfmat.vget(v, 2), 0.0)
+    let m = kfmat.zeros(2, 3)
+    test.assert_eq(m.r, 2)
+    test.assert_eq(m.c, 3)
+    test.assert_eq(kfmat.get(m, 1, 2), 0.0)
+    test.assert_eq(kfmat.zeros(0, 0).r, 0)
+
+@test
+fn test_the_vector_constructors_fill_in_order()
+    test.assert_eq(kfmat.vec1(1.0).n, 1)
+    let a = kfmat.vec2(1.0, 2.0)
+    test.assert_eq(a.n, 2)
+    test.assert_eq(kfmat.vget(a, 1), 2.0)
+    let b = kfmat.vec3(1.0, 2.0, 3.0)
+    test.assert_eq(kfmat.vget(b, 2), 3.0)
+    let c = kfmat.vec4(1.0, 2.0, 3.0, 4.0)
+    test.assert_eq(c.n, 4)
+    test.assert_eq(kfmat.vget(c, 3), 4.0)
+    let d = kfmat.vec_of([5.0, 6.0, 7.0])
+    test.assert_eq(d.n, 3)
+    test.assert_eq(kfmat.vget(d, 0), 5.0)
+
+@test
+fn test_the_identity_and_a_diagonal_matrix_have_the_diagonal_they_name()
+    let i = kfmat.identity(3)
+    test.assert_eq(kfmat.get(i, 0, 0), 1.0)
+    test.assert_eq(kfmat.get(i, 1, 1), 1.0)
+    test.assert_eq(kfmat.get(i, 0, 1), 0.0)
+    let d = kfmat.diagonal(2, 0.5)
+    test.assert_eq(kfmat.get(d, 1, 1), 0.5)
+    test.assert_eq(kfmat.get(d, 1, 0), 0.0)
+
+@test
+fn test_a_list_fills_a_matrix_row_by_row()
+    let m = kfmat.from_list(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    test.assert_eq(kfmat.get(m, 0, 2), 3.0)
+    test.assert_eq(kfmat.get(m, 1, 0), 4.0)
+
+@test
+fn test_set_and_vset_answer_a_copy_and_leave_the_original()
+    let m = kfmat.identity(2)
+    let n = kfmat.set(m, 0, 1, 9.0)
+    test.assert_eq(kfmat.get(n, 0, 1), 9.0)
+    test.assert_eq(kfmat.get(m, 0, 1), 0.0)
+    let v = kfmat.vec2(1.0, 2.0)
+    let w = kfmat.vset(v, 1, 8.0)
+    test.assert_eq(kfmat.vget(w, 1), 8.0)
+    test.assert_eq(kfmat.vget(v, 1), 2.0)
+
+// ── Vectors ──────────────────────────────────────────────────────────
+
+@test
+fn test_vector_sum_difference_scale_and_dot_product()
+    let a = kfmat.vec3(1.0, 2.0, 3.0)
+    let b = kfmat.vec3(4.0, 5.0, 6.0)
+    test.assert_eq(kfmat.vget(kfmat.vadd(a, b), 2), 9.0)
+    test.assert_eq(kfmat.vget(kfmat.vsub(b, a), 0), 3.0)
+    test.assert_eq(kfmat.vget(kfmat.vscale(a, 2.0), 1), 4.0)
+    test.assert_eq(kfmat.dot(a, b), 32.0)
+
+// ── Matrices ─────────────────────────────────────────────────────────
+
+@test
+fn test_the_transpose_swaps_rows_and_columns_of_a_rectangle()
+    let t = kfmat.transpose(kfmat.from_list(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))
+    test.assert_eq(t.r, 3)
+    test.assert_eq(t.c, 2)
+    test.assert_eq(kfmat.get(t, 2, 0), 3.0)
+    test.assert_eq(kfmat.get(t, 0, 1), 4.0)
+
+@test
+fn test_matrix_sum_difference_and_scale()
+    let a = kfmat.from_list(2, 2, [1.0, 2.0, 3.0, 4.0])
+    let b = kfmat.from_list(2, 2, [10.0, 20.0, 30.0, 40.0])
+    test.assert_eq(kfmat.get(kfmat.add(a, b), 1, 1), 44.0)
+    test.assert_eq(kfmat.get(kfmat.sub(b, a), 0, 1), 18.0)
+    test.assert_eq(kfmat.get(kfmat.scale(a, 0.5), 1, 0), 1.5)
+
+@test
+fn test_the_product_of_a_2_by_3_and_a_3_by_2_matrix()
+    let a = kfmat.from_list(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    let b = kfmat.from_list(3, 2, [7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
+    let p = kfmat.mul(a, b)
+    test.assert_eq(p.r, 2)
+    test.assert_eq(p.c, 2)
+    test.assert_eq(kfmat.get(p, 0, 0), 58.0)
+    test.assert_eq(kfmat.get(p, 0, 1), 64.0)
+    test.assert_eq(kfmat.get(p, 1, 0), 139.0)
+    test.assert_eq(kfmat.get(p, 1, 1), 154.0)
+
+@test
+fn test_the_product_with_a_transpose_equals_the_product_of_the_transpose()
+    let a = kfmat.from_list(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    let b = kfmat.from_list(2, 3, [7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
+    let direct = kfmat.mul_t(a, b)
+    let built = kfmat.mul(a, kfmat.transpose(b))
+    for i in 0..2
+        for j in 0..2
+            test.assert_eq(kfmat.get(direct, i, j), kfmat.get(built, i, j))
+    test.assert_eq(kfmat.get(direct, 0, 0), 50.0)
+
+@test
+fn test_a_matrix_times_a_vector_and_its_transpose_times_a_vector()
+    let a = kfmat.from_list(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    let y = kfmat.mul_vec(a, kfmat.vec3(1.0, 0.0, -1.0))
+    test.assert_eq(y.n, 2)
+    test.assert_eq(kfmat.vget(y, 0), -2.0)
+    test.assert_eq(kfmat.vget(y, 1), -2.0)
+    let t = kfmat.mul_t_vec(a, kfmat.vec2(1.0, 1.0))
+    test.assert_eq(t.n, 3)
+    test.assert_eq(kfmat.vget(t, 0), 5.0)
+    test.assert_eq(kfmat.vget(t, 2), 9.0)
+
+@test
+fn test_a_vector_converts_to_a_column_or_a_row_and_back()
+    let v = kfmat.vec3(1.0, 2.0, 3.0)
+    let c = kfmat.column(v)
+    test.assert_eq(c.r, 3)
+    test.assert_eq(c.c, 1)
+    test.assert_eq(kfmat.vget(kfmat.first_column(c), 2), 3.0)
+    let r = kfmat.row(v)
+    test.assert_eq(r.r, 1)
+    test.assert_eq(r.c, 3)
+    let m = kfmat.from_list(2, 2, [1.0, 2.0, 3.0, 4.0])
+    test.assert_eq(kfmat.vget(kfmat.row_of(m, 1), 0), 3.0)
+    test.assert_eq(kfmat.vget(kfmat.first_column(m), 1), 3.0)
+
+@test
+fn test_the_trace_sums_the_diagonal()
+    test.assert_eq(kfmat.trace(kfmat.from_list(2, 2, [1.0, 9.0, 9.0, 4.0])), 5.0)
+
+// ── Symmetry and definiteness ────────────────────────────────────────
+
+@test
+fn test_asymmetry_is_the_largest_mirrored_difference_whichever_way_it_leans()
+    let upper = kfmat.from_list(2, 2, [1.0, 3.0, 2.0, 1.0])
+    let lower = kfmat.from_list(2, 2, [1.0, 2.0, 3.0, 1.0])
+    test.assert_eq(kfmat.asymmetry(upper), 1.0)
+    test.assert_eq(kfmat.asymmetry(lower), 1.0)
+    test.assert(kfmat.is_symmetric(kfmat.identity(3), 0.0))
+    test.assert(not kfmat.is_symmetric(upper, 0.5))
+    test.assert(kfmat.is_symmetric(upper, 1.0))
+
+@test
+fn test_symmetrize_averages_each_mirrored_pair()
+    let s = kfmat.symmetrize(kfmat.from_list(2, 2, [1.0, 2.0, 4.0, 1.0]))
+    test.assert_eq(kfmat.get(s, 0, 1), 3.0)
+    test.assert_eq(kfmat.get(s, 1, 0), 3.0)
+    test.assert_eq(kfmat.get(s, 0, 0), 1.0)
+
+@test
+fn test_the_ldl_factors_of_a_known_matrix_are_the_ones_worked_by_hand()
+    let f = kfmat.ldl(kfmat.from_list(3, 3, [4.0, 2.0, 2.0, 2.0, 5.0, 3.0, 2.0, 3.0, 6.0]))
+    test.assert_eq(kfmat.get(f, 0, 0), 4.0)
+    test.assert_eq(kfmat.get(f, 1, 1), 4.0)
+    test.assert_eq(kfmat.get(f, 2, 2), 4.0)
+    test.assert_eq(kfmat.get(f, 1, 0), 0.5)
+    test.assert_eq(kfmat.get(f, 2, 0), 0.5)
+    test.assert_eq(kfmat.get(f, 2, 1), 0.5)
+
+@test
+fn test_definiteness_accepts_a_covariance_and_refuses_the_three_ways_not_to_be_one()
+    test.assert(kfmat.is_positive_definite(kfmat.from_list(3, 3, [4.0, 2.0, 2.0, 2.0, 5.0, 3.0, 2.0, 3.0, 6.0]), 0.000001))
+    // Indefinite: eigenvalues 3 and -1.
+    test.assert(not kfmat.is_positive_definite(kfmat.from_list(2, 2, [1.0, 2.0, 2.0, 1.0]), 0.000001))
+    // Semi-definite: rank one, so a zero pivot.
+    test.assert(not kfmat.is_positive_definite(kfmat.from_list(2, 2, [1.0, 1.0, 1.0, 1.0]), 0.000001))
+    // No positive diagonal element at all.
+    test.assert(not kfmat.is_positive_definite(kfmat.zeros(2, 2), 0.000001))
+
+@test
+fn test_a_factorisation_with_a_zero_pivot_leaves_its_column_zero_rather_than_dividing()
+    // Row 0 is zero, so the first pivot is zero and the factor below it
+    // is set to zero.
+    let f = kfmat.ldl(kfmat.from_list(2, 2, [0.0, 1.0, 1.0, 2.0]))
+    test.assert_eq(kfmat.get(f, 1, 0), 0.0)
+    test.assert_eq(kfmat.get(f, 0, 0), 0.0)
+
+@test
+fn test_solve_spd_matches_the_numpy_solution_for_two_right_hand_sides()
+    let a = kfmat.from_list(3, 3, [4.0, 2.0, 2.0, 2.0, 5.0, 3.0, 2.0, 3.0, 6.0])
+    let b = kfmat.from_list(3, 2, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    let x = kfmat.solve_spd(a, b)
+    let want = [-0.265625, -0.09375, 0.21875, 0.3125, 0.8125, 0.875]
+    for i in 0..3
+        for j in 0..2
+            test.assert_approx(kfmat.get(x, i, j) as Float, want[i * 2 + j], 0.00001)
+
+// ── The contracts that panic ─────────────────────────────────────────
+
+@test
+fn test_a_size_outside_the_capacity_stops_the_program()
+    test.assert_raises(() => kfmat.vzeros(kfmat.MAX_DIM + 1))
+    test.assert_raises(() => kfmat.vzeros(-1))
+    test.assert_raises(() => kfmat.zeros(kfmat.MAX_DIM + 1, 1))
+    test.assert_raises(() => kfmat.zeros(1, kfmat.MAX_DIM + 1))
+    test.assert_raises(() => kfmat.zeros(-1, 1))
+    test.assert_raises(() => kfmat.zeros(1, -1))
+    test.assert_raises(() => kfmat.from_list(2, 2, [1.0, 2.0, 3.0]))
+
+// A closure may not capture a `@value` binding, so each operand a
+// refusal below uses is built by a call inside the closure.
+fn m23() -> Mat
+    kfmat.zeros(2, 3)
+
+fn m32() -> Mat
+    kfmat.zeros(3, 2)
+
+fn vz2() -> KVec
+    kfmat.vzeros(2)
+
+fn vz3() -> KVec
+    kfmat.vzeros(3)
+
+@test
+fn test_operands_of_different_shapes_stop_the_program()
+    test.assert_raises(() => kfmat.vadd(vz2(), vz3()))
+    test.assert_raises(() => kfmat.vsub(vz2(), vz3()))
+    test.assert_raises(() => kfmat.dot(vz2(), vz3()))
+    test.assert_raises(() => kfmat.add(m23(), m32()))
+    test.assert_raises(() => kfmat.sub(m23(), m32()))
+    test.assert_raises(() => kfmat.mul(m23(), m23()))
+    test.assert_raises(() => kfmat.mul_t(m23(), m32()))
+    test.assert_raises(() => kfmat.mul_vec(m23(), vz2()))
+    test.assert_raises(() => kfmat.mul_t_vec(m23(), vz3()))
+    test.assert_raises(() => kfmat.trace(m23()))
+    test.assert_raises(() => kfmat.asymmetry(m23()))
+    test.assert_raises(() => kfmat.symmetrize(m23()))
+    test.assert_raises(() => kfmat.ldl(m23()))
+    test.assert_raises(() => kfmat.is_positive_definite(m23(), 0.001))
+    test.assert_raises(() => kfmat.solve_spd(m23(), m32()))
+    test.assert_raises(() => kfmat.solve_spd(kfmat.identity(2), m32()))

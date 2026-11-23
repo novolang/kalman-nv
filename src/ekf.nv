@@ -1,0 +1,114 @@
+// ekf — the extended Kalman filter.
+//
+// A nonlinear model `x' = f(x)`, `z = h(x)` is handled by linearising
+// at the estimate: the filter needs the values `f(x)` and `h(x)` and
+// the Jacobians `F = df/dx` and `H = dh/dx`, both evaluated at the
+// current estimate.  THE CALLER EVALUATES THEM.  A function value
+// passed into the filter would be a closure, and a closure that
+// captures anything allocates; evaluating the model where the model
+// lives keeps the filter a function of numbers.
+//
+//     // Predict: the model's function and Jacobian, at the estimate.
+//     k = ekf.predict(k, f_of_x, f_jacobian, q)
+//     // Update: the predicted measurement and its Jacobian.
+//     k = ekf.update(k, z, h_of_x, h_jacobian, r)
+//
+// The covariance algebra, the Joseph form, the innovation, the gate and
+// the fault codes are those of `kalman`: this module is the same
+// filter with the model's values supplied, and `kalman`'s linear
+// functions are the case `f(x) = F x`, `h(x) = H x`.  The state a step
+// answers is a `kalman.Kf`, so `kalman.state`, `kalman.covariance`,
+// `kalman.innovation` and `kalman.gate` read it.
+//
+// THE LINEARISATION IS AT THE ESTIMATE BEFORE THE STEP.  For several
+// scalar measurements of a nonlinear model, `update_scalar` is called
+// once per measurement, and the caller re-evaluates `h(x)` and its
+// Jacobian at the estimate each earlier update left, which is the
+// iterated form and the more accurate one.
+
+use kalman
+use kfmat
+
+// The prediction for a nonlinear move: the state becomes `x_pred =
+// f(x)` and the covariance `F P Fᵀ + Q`, `f_jac` being the Jacobian
+// `F` of `f` at the old estimate.
+//
+// ```novo
+// use ekf
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     // x' = x * x at x = 2: the value is 4 and the slope is 4.
+//     let k = kalman.filter(kfmat.vec1(2.0), kfmat.diagonal(1, 1.0))
+//     let k2 = ekf.predict(k, kfmat.vec1(4.0), kfmat.diagonal(1, 4.0), kfmat.diagonal(1, 0.0))
+//     println("${kalman.state(k2).a[0]} ${kfmat.get(kalman.covariance(k2), 0, 0)}")   // 4 16
+// ```
+pub fn predict(k: Kf, x_pred: KVec, f_jac: Mat, q: Mat) -> Kf []
+    kalman.predict_to(k, x_pred, f_jac, q)
+
+// The update for a nonlinear measurement: `z` was measured, `hx =
+// h(x)` is the value the model predicts at the estimate, `h_jac` is the
+// Jacobian of `h` there, and `r` the measurement covariance.
+//
+// ```novo
+// use ekf
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     let k = kalman.filter(kfmat.vec1(2.0), kfmat.diagonal(1, 1.0))
+//     // z = x * x: the model says 4 at x = 2, with slope 4; 5 was measured.
+//     let k2 = ekf.update(k, kfmat.vec1(5.0), kfmat.vec1(4.0), kfmat.diagonal(1, 4.0), kfmat.diagonal(1, 1.0))
+//     println("${kalman.innovation(k2).a[0]}")   // 1
+// ```
+pub fn update(k: Kf, z: KVec, hx: KVec, h_jac: Mat, r: Mat) -> Kf []
+    kalman.correct(k, z, hx, h_jac, r)
+
+// The update for one nonlinear measurement `z`: `hx` is the model's
+// value at the estimate, `h_row` the Jacobian row there and `r` the
+// variance.  No matrix is inverted.
+//
+// ```novo
+// use ekf
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     let k = kalman.filter(kfmat.vec1(2.0), kfmat.diagonal(1, 1.0))
+//     let k2 = ekf.update_scalar(k, 5.0, 4.0, kfmat.vec1(4.0), 1.0)
+//     println("${kalman.innovation(k2).a[0]}")   // 1
+// ```
+pub fn update_scalar(k: Kf, z: fp32, hx: fp32, h_row: KVec, r: fp32) -> Kf []
+    kalman.correct_scalar(k, z, hx, h_row, r)
+
+// The innovation of a nonlinear measurement, for gating before the
+// update.  The filter is not changed.
+//
+// ```novo
+// use ekf
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     let k = kalman.filter(kfmat.vec1(2.0), kfmat.diagonal(1, 1.0))
+//     let inn = ekf.innovate(k, kfmat.vec1(5.0), kfmat.vec1(4.0), kfmat.diagonal(1, 4.0), kfmat.diagonal(1, 1.0))
+//     println("${kalman.gate(inn, 3.84)}")   // true
+// ```
+pub fn innovate(k: Kf, z: KVec, hx: KVec, h_jac: Mat, r: Mat) -> Innovation []
+    kalman.innovate_with(k, z, hx, h_jac, r)
+
+// The innovation of one nonlinear measurement.
+//
+// ```novo
+// use ekf
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     let k = kalman.filter(kfmat.vec1(2.0), kfmat.diagonal(1, 1.0))
+//     let inn = ekf.innovate_scalar(k, 5.0, 4.0, kfmat.vec1(4.0), 1.0)
+//     println("${kalman.gate(inn, 3.84)}")   // true
+// ```
+pub fn innovate_scalar(k: Kf, z: fp32, hx: fp32, h_row: KVec, r: fp32) -> Innovation []
+    kalman.innovate_scalar_with(k, z, hx, h_row, r)

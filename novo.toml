@@ -1,0 +1,32 @@
+[package]
+name        = "kalman-nv"
+version     = "0.1.0"
+description = "A linear and an extended Kalman filter over matrices whose capacity is fixed at build time, in single precision and with no allocation: predict, the update with the Joseph form of the covariance, a symmetric and a positive-definite check, the innovation and its covariance exposed for gating, and a scalar update for uncorrelated measurements that takes no inverse at all."
+license     = "Apache-2.0"
+
+stability   = "experimental"
+
+# `core`: a filter is arithmetic over numbers the caller already holds.
+# Nothing is read, nothing is written, no clock is consulted, and no
+# function declares an effect.  `tests/embedded_probe.nv` builds the
+# package for a Cortex-M, so the claim that nothing here allocates is a
+# link, not a sentence.
+layer       = "core"
+
+category    = "embedded"
+
+tags        = ["kalman", "ekf", "filter", "estimation", "sensor-fusion", "matrix", "fp32", "embedded", "no-alloc"]
+repository  = "https://github.com/novolang/kalman-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.26.1"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Kalman filters for a core with no heap"
+
+[dependencies]
+# None.  linalg-nv would be the natural one and does not fit a device
+# build: its matrix is a heap value in `Float`.  The README's design
+# section gives the measurement.

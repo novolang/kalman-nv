@@ -1,0 +1,571 @@
+// kalman — the linear Kalman filter, and the algebra the extended
+// filter shares with it.
+//
+// THE FILTER IS A VALUE.  A `Kf` holds the state estimate, its
+// covariance, the last innovation and a fault code, and every step
+// answers a new `Kf`:
+//
+//     k = kalman.predict(k, f, q)
+//     k = kalman.update(k, z, h, r)
+//
+// Nothing is allocated and nothing is hidden: a `Kf` lives in the
+// caller's frame, and the covariance a caller reads after a step is
+// the one the next step starts from.
+//
+// THE COVARIANCE UPDATE IS THE JOSEPH FORM,
+//
+//     P' = (I - K H) P (I - K H)ᵀ + K R Kᵀ,
+//
+// not the short form `(I - K H) P`.  The two are equal in exact
+// arithmetic when `K` is the optimal gain, and the short form is a
+// difference of nearly equal matrices that can lose symmetry and
+// positive definiteness through rounding when a measurement is far
+// more precise than the estimate.  The Joseph form is a sum of two
+// positive semi-definite terms, so rounding cannot make it indefinite,
+// and it stays correct when the gain is not optimal.  After each step the covariance is also averaged
+// with its transpose, which removes what asymmetry rounding leaves.
+//
+// THE INNOVATION IS EXPOSED because gating needs it before the update
+// is applied.  `innovate` answers `y = z - H x`, its covariance
+// `S = H P Hᵀ + R` and the normalised innovation squared `yᵀ S⁻¹ y`,
+// and changes nothing; `gate` compares that number with a chi-square
+// threshold; `update` then applies the measurement or the caller drops
+// it.  An update that was applied leaves the same three numbers in the
+// filter, and `innovation`, `innovation_cov` and `nis` read them.
+//
+// A SCALAR UPDATE FOR UNCORRELATED MEASUREMENTS.  When the noise of the
+// measurements is independent, a vector `z` is the same information as
+// its components taken one at a time, each a scalar update.  `S` is
+// then a single number and the gain is a vector divided by it, so no
+// matrix is inverted at all.  `update_each` runs that loop over the
+// rows of `H` and the diagonal of `R`.
+//
+// A FAULT IS A NUMBER, NOT A `Result`.  A `@value` struct cannot be
+// part of a `Result` payload without being boxed, which allocates, so
+// the filter carries its own status in `fault`: 0 when the covariance
+// is finite, symmetric and positive definite after the last step, and
+// the code of the first thing that is not otherwise.  An update whose
+// innovation covariance is not positive definite is refused: the state
+// and covariance stay as they were and the code is `KF_SINGULAR_INNOVATION`.
+
+use kfmat
+
+// The covariance is finite, symmetric and positive definite.
+pub const KF_OK = 0
+
+// The state or the covariance holds a NaN or an infinity.
+pub const KF_NOT_FINITE = 1
+
+// The covariance differs from its transpose by more than the
+// tolerance of `check`.
+pub const KF_NOT_SYMMETRIC = 2
+
+// The covariance is not positive definite.
+pub const KF_NOT_POSITIVE = 3
+
+// An update was refused because the innovation covariance is not
+// positive definite.  The state and the covariance are unchanged.
+pub const KF_SINGULAR_INNOVATION = 4
+
+// The relative tolerance under which two mirrored covariance elements
+// count as equal: this times the largest diagonal element.
+fn symmetry_tol() -> fp32 []
+    1.0e-4
+
+// The relative floor under which a pivot counts as zero.
+fn pivot_floor() -> fp32 []
+    1.0e-6
+
+// What a measurement told the filter before it was applied.
+//
+// ```novo
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     let k = kalman.filter(kfmat.vec1(0.0), kfmat.diagonal(1, 4.0))
+//     let inn = kalman.innovate(k, kfmat.vec1(2.0), kfmat.identity(1), kfmat.diagonal(1, 1.0))
+//     println("${inn.nis}")   // 0.8
+// ```
+pub @value
+struct Innovation
+    // The number of measurements.
+    m: Int
+    // The innovation `y = z - h(x)`, `m` elements.
+    y: KVec
+    // The innovation covariance `S = H P Hᵀ + R`, `m` by `m`.
+    s: Mat
+    // The normalised innovation squared `yᵀ S⁻¹ y`.  Zero when `ok` is false.
+    nis: fp32
+    // Whether `s` is positive definite.  When it is not, no gain exists.
+    ok: Bool
+
+// The filter: an estimate, its covariance, the last innovation and the
+// result of the last check.
+//
+// ```novo
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     let k = kalman.filter(kfmat.vec2(0.0, 1.0), kfmat.identity(2))
+//     println("${k.n} ${k.fault}")   // 2 0
+// ```
+pub @value
+struct Kf
+    // The number of states.
+    n: Int
+    // The state estimate, `n` elements.
+    x: KVec
+    // The covariance of the estimate, `n` by `n`.
+    p: Mat
+    // The innovation of the last update, applied or refused.
+    last: Innovation
+    // `KF_OK`, or the code `check` found after the last step.
+    fault: Int
+
+// ── Construction and reading ─────────────────────────────────────────
+
+// A filter at the estimate `x0` with covariance `p0`.
+//
+// ```novo
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     let k = kalman.filter(kfmat.vec2(0.0, 0.0), kfmat.diagonal(2, 100.0))
+//     println("${kalman.dim(k)}")   // 2
+// ```
+pub fn filter(x0: KVec, p0: Mat) -> Kf []
+    if p0.r != x0.n or p0.c != x0.n
+        panic.panic("kalman.filter: the covariance is not n by n for the state's n")
+    let none = Innovation { m: 0, y: kfmat.vzeros(0), s: kfmat.zeros(0, 0), nis: 0.0, ok: true }
+    let k = Kf { n: x0.n, x: x0, p: p0, last: none, fault: KF_OK }
+    checked(k)
+
+// The number of states.
+//
+// ```novo
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     let k = kalman.filter(kfmat.vec3(0.0, 0.0, 0.0), kfmat.identity(3))
+//     println("${kalman.dim(k)}")   // 3
+// ```
+pub fn dim(k: Kf) -> Int []
+    k.n
+
+// The state estimate.
+//
+// ```novo
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     let k = kalman.filter(kfmat.vec2(3.0, 4.0), kfmat.identity(2))
+//     println("${kalman.state(k).a[1]}")   // 4
+// ```
+pub fn state(k: Kf) -> KVec []
+    k.x
+
+// The covariance of the estimate.
+//
+// ```novo
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     let k = kalman.filter(kfmat.vec1(0.0), kfmat.diagonal(1, 9.0))
+//     println("${kfmat.get(kalman.covariance(k), 0, 0)}")   // 9
+// ```
+pub fn covariance(k: Kf) -> Mat []
+    k.p
+
+// The innovation `y = z - h(x)` of the last update.
+//
+// ```novo
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     var k = kalman.filter(kfmat.vec1(1.0), kfmat.diagonal(1, 1.0))
+//     k = kalman.update(k, kfmat.vec1(4.0), kfmat.identity(1), kfmat.diagonal(1, 1.0))
+//     println("${kalman.innovation(k).a[0]}")   // 3
+// ```
+pub fn innovation(k: Kf) -> KVec []
+    k.last.y
+
+// The innovation covariance `S` of the last update.
+//
+// ```novo
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     var k = kalman.filter(kfmat.vec1(1.0), kfmat.diagonal(1, 1.0))
+//     k = kalman.update(k, kfmat.vec1(4.0), kfmat.identity(1), kfmat.diagonal(1, 1.0))
+//     println("${kfmat.get(kalman.innovation_cov(k), 0, 0)}")   // 2
+// ```
+pub fn innovation_cov(k: Kf) -> Mat []
+    k.last.s
+
+// The normalised innovation squared of the last update.
+//
+// ```novo
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     var k = kalman.filter(kfmat.vec1(1.0), kfmat.diagonal(1, 1.0))
+//     k = kalman.update(k, kfmat.vec1(4.0), kfmat.identity(1), kfmat.diagonal(1, 1.0))
+//     println("${kalman.nis(k)}")   // 4.5
+// ```
+pub fn nis(k: Kf) -> fp32 []
+    k.last.nis
+
+// The fault code of the last step: `KF_OK` or one of the other four.
+//
+// ```novo
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     let k = kalman.filter(kfmat.vec1(0.0), kfmat.diagonal(1, 1.0))
+//     println("${kalman.fault(k) == KF_OK}")   // true
+// ```
+pub fn fault(k: Kf) -> Int []
+    k.fault
+
+// Whether a value is neither a NaN nor an infinity: a finite value
+// minus itself is zero, and the other two give NaN.
+fn is_finite(v: fp32) -> Bool []
+    let zero: fp32 = 0.0
+    v - v == zero
+
+// The filter with its fault code set to the answer of `check`.
+fn checked(k: Kf) -> Kf []
+    Kf { n: k.n, x: k.x, p: k.p, last: k.last, fault: check(k) }
+
+// The covariance check.  Answers `KF_OK`, or the first of
+// `KF_NOT_FINITE`, `KF_NOT_SYMMETRIC` and `KF_NOT_POSITIVE` that holds.
+//
+// Symmetry is judged against the largest diagonal element, so a
+// covariance in metres squared and one in millimetres squared get the
+// same verdict.  Positive definiteness is the `L D Lᵀ` pivot test of
+// `kfmat.is_positive_definite`.
+//
+// ```novo
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     let k = kalman.filter(kfmat.vec1(0.0), kfmat.diagonal(1, -1.0))
+//     println("${kalman.check(k) == KF_NOT_POSITIVE}")   // true
+// ```
+pub @wrapping
+fn check(k: Kf) -> Int []
+    for i in 0..k.n
+        if not is_finite(k.x.a[i])
+            return KF_NOT_FINITE
+    for i in 0..k.n * k.n
+        if not is_finite(k.p.a[i])
+            return KF_NOT_FINITE
+    let zero: fp32 = 0.0
+    var big = zero
+    for i in 0..k.n
+        let d = k.p.a[i * k.n + i]
+        big = if d > big
+            d
+        else
+            big
+    if not kfmat.is_symmetric(k.p, symmetry_tol() * big)
+        return KF_NOT_SYMMETRIC
+    if not kfmat.is_positive_definite(k.p, pivot_floor())
+        return KF_NOT_POSITIVE
+    KF_OK
+
+// ── Gating ───────────────────────────────────────────────────────────
+
+// Whether a measurement is consistent with the filter: the innovation
+// covariance has a gain, and the normalised innovation squared is at
+// most `threshold`.  For a Gaussian measurement the statistic follows a
+// chi-square law with `inn.m` degrees of freedom, so `threshold` is a
+// chi-square quantile, such as 3.84 for one degree of freedom at 95 %.
+//
+// ```novo
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     let k = kalman.filter(kfmat.vec1(0.0), kfmat.diagonal(1, 1.0))
+//     let inn = kalman.innovate(k, kfmat.vec1(10.0), kfmat.identity(1), kfmat.diagonal(1, 1.0))
+//     println("${kalman.gate(inn, 3.84)}")   // false
+// ```
+pub fn gate(inn: Innovation, threshold: fp32) -> Bool []
+    inn.ok and inn.nis <= threshold
+
+// ── Prediction ───────────────────────────────────────────────────────
+
+// The prediction step for a state that moves to `x_pred` with the
+// Jacobian `f` of that move: `x' = x_pred`, `P' = F P Fᵀ + Q`.
+//
+// This is the form both filters share.  The linear filter's `predict`
+// calls it with `x_pred = F x`; the extended filter's calls it with
+// `x_pred = f(x)` that the caller evaluated.
+//
+// ```novo
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     let k = kalman.filter(kfmat.vec1(2.0), kfmat.diagonal(1, 1.0))
+//     let k2 = kalman.predict_to(k, kfmat.vec1(5.0), kfmat.identity(1), kfmat.diagonal(1, 0.5))
+//     println("${kalman.state(k2).a[0]} ${kfmat.get(kalman.covariance(k2), 0, 0)}")   // 5 1.5
+// ```
+pub fn predict_to(k: Kf, x_pred: KVec, f: Mat, q: Mat) -> Kf []
+    if x_pred.n != k.n or f.r != k.n or f.c != k.n or q.r != k.n or q.c != k.n
+        panic.panic("kalman.predict_to: a dimension does not match the state")
+    let p = kfmat.symmetrize(kfmat.add(kfmat.mul_t(kfmat.mul(f, k.p), f), q))
+    checked(Kf { n: k.n, x: x_pred, p: p, last: k.last, fault: KF_OK })
+
+// The linear prediction `x' = F x`, `P' = F P Fᵀ + Q`.
+//
+// ```novo
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     let k = kalman.filter(kfmat.vec2(0.0, 1.0), kfmat.diagonal(2, 1.0))
+//     let f = kfmat.from_list(2, 2, [1.0, 0.5, 0.0, 1.0])
+//     let k2 = kalman.predict(k, f, kfmat.diagonal(2, 0.0))
+//     println("${kalman.state(k2).a[0]}")   // 0.5
+// ```
+pub fn predict(k: Kf, f: Mat, q: Mat) -> Kf []
+    predict_to(k, kfmat.mul_vec(f, k.x), f, q)
+
+// The linear prediction with a control input already mapped into the
+// state space, `bu = B u`: `x' = F x + bu`.  The covariance is as in
+// `predict`.
+//
+// ```novo
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     let k = kalman.filter(kfmat.vec1(1.0), kfmat.diagonal(1, 1.0))
+//     let k2 = kalman.predict_input(k, kfmat.identity(1), kfmat.diagonal(1, 0.0), kfmat.vec1(0.25))
+//     println("${kalman.state(k2).a[0]}")   // 1.25
+// ```
+pub fn predict_input(k: Kf, f: Mat, q: Mat, bu: KVec) -> Kf []
+    predict_to(k, kfmat.vadd(kfmat.mul_vec(f, k.x), bu), f, q)
+
+// ── The innovation ───────────────────────────────────────────────────
+
+// The innovation of the measurement `z` whose predicted value is
+// `zhat`, with the Jacobian `h` of the measurement function and the
+// noise covariance `r`.  The filter is not changed.
+//
+// ```novo
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     let k = kalman.filter(kfmat.vec2(0.0, 0.0), kfmat.diagonal(2, 1.0))
+//     let h = kfmat.from_list(1, 2, [1.0, 0.0])
+//     let inn = kalman.innovate_with(k, kfmat.vec1(3.0), kfmat.vec1(0.0), h, kfmat.diagonal(1, 8.0))
+//     println("${kfmat.get(inn.s, 0, 0)}")   // 9
+// ```
+pub fn innovate_with(k: Kf, z: KVec, zhat: KVec, h: Mat, r: Mat) -> Innovation []
+    if zhat.n != z.n or h.r != z.n or h.c != k.n or r.r != z.n or r.c != z.n
+        panic.panic("kalman.innovate_with: a dimension does not match the measurement")
+    let y = kfmat.vsub(z, zhat)
+    let s = kfmat.symmetrize(kfmat.add(kfmat.mul_t(kfmat.mul(h, k.p), h), r))
+    if not kfmat.is_positive_definite(s, pivot_floor())
+        return Innovation { m: z.n, y: y, s: s, nis: 0.0, ok: false }
+    let w = kfmat.first_column(kfmat.solve_spd(s, kfmat.column(y)))
+    Innovation { m: z.n, y: y, s: s, nis: kfmat.dot(y, w), ok: true }
+
+// The innovation of `z` under the linear measurement model `z = H x`.
+//
+// ```novo
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     let k = kalman.filter(kfmat.vec1(0.0), kfmat.diagonal(1, 4.0))
+//     let inn = kalman.innovate(k, kfmat.vec1(2.0), kfmat.identity(1), kfmat.diagonal(1, 1.0))
+//     println("${inn.nis}")   // 0.8
+// ```
+pub fn innovate(k: Kf, z: KVec, h: Mat, r: Mat) -> Innovation []
+    innovate_with(k, z, kfmat.mul_vec(h, k.x), h, r)
+
+// The innovation of one measurement `z` of predicted value `zhat`,
+// whose Jacobian is the row `h` and whose variance is `r`.  `S` is a
+// single number, and the filter is not changed.
+//
+// ```novo
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     let k = kalman.filter(kfmat.vec2(0.0, 0.0), kfmat.diagonal(2, 1.0))
+//     let inn = kalman.innovate_scalar_with(k, 3.0, 0.0, kfmat.vec2(1.0, 0.0), 8.0)
+//     println("${inn.nis}")   // 1
+// ```
+pub fn innovate_scalar_with(k: Kf, z: fp32, zhat: fp32, h: KVec, r: fp32) -> Innovation []
+    if h.n != k.n
+        panic.panic("kalman.innovate_scalar_with: the row is not n long")
+    let y = z - zhat
+    let ph = kfmat.mul_vec(k.p, h)
+    let sv = kfmat.dot(h, ph) + r
+    var s = kfmat.zeros(1, 1)
+    s.a[0] = sv
+    let zero: fp32 = 0.0
+    if not (sv > zero and is_finite(sv))
+        return Innovation { m: 1, y: kfmat.vec1(y), s: s, nis: 0.0, ok: false }
+    Innovation { m: 1, y: kfmat.vec1(y), s: s, nis: y * y / sv, ok: true }
+
+// The innovation of one measurement under the linear model `z = h x`.
+//
+// ```novo
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     let k = kalman.filter(kfmat.vec2(0.0, 0.0), kfmat.diagonal(2, 1.0))
+//     let inn = kalman.innovate_scalar(k, 3.0, kfmat.vec2(1.0, 0.0), 8.0)
+//     println("${inn.nis}")   // 1
+// ```
+pub fn innovate_scalar(k: Kf, z: fp32, h: KVec, r: fp32) -> Innovation []
+    innovate_scalar_with(k, z, kfmat.dot(h, k.x), h, r)
+
+// ── The update ───────────────────────────────────────────────────────
+
+// The Joseph form of the covariance update for the gain `gain` (`n` by
+// `m`), the measurement Jacobian `h` (`m` by `n`) and the measurement
+// covariance `r` (`m` by `m`): `(I - K H) P (I - K H)ᵀ + K R Kᵀ`,
+// averaged with its transpose.
+//
+// Replacing this with the short form `(I - K H) P` changes no value a
+// test can observe: the gains here are the optimal ones, for which the
+// two forms are equal in exact arithmetic, and they differ only in how
+// rounding treats the result.  The Joseph form is kept for that
+// difference, which a reviewer reads and no assertion measures.
+fn joseph(p: Mat, gain: Mat, h: Mat, r: Mat) -> Mat []
+    let a = kfmat.sub(kfmat.identity(p.r), kfmat.mul(gain, h))
+    let body = kfmat.mul_t(kfmat.mul(a, p), a)
+    let noise = kfmat.mul_t(kfmat.mul(gain, r), gain)
+    kfmat.symmetrize(kfmat.add(body, noise))
+
+// The update with the measurement `z` whose predicted value is `zhat`,
+// the Jacobian `h` and the covariance `r`.
+//
+// The gain is `K = P Hᵀ S⁻¹`.  `S` is symmetric positive definite, so
+// `S⁻¹ (H P)` is solved by the `L D Lᵀ` factors of `S` and transposed:
+// the only inverse taken is `m` by `m`, never larger than the
+// measurement.  The state moves by `K y` and the covariance by the
+// Joseph form.
+//
+// This is the form both filters share; `update` and the extended
+// filter's `update` call it.
+//
+// ```novo
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     let k = kalman.filter(kfmat.vec1(0.0), kfmat.diagonal(1, 4.0))
+//     let k2 = kalman.correct(k, kfmat.vec1(5.0), kfmat.vec1(0.0), kfmat.identity(1), kfmat.diagonal(1, 1.0))
+//     println("${kalman.state(k2).a[0]}")   // 4
+// ```
+pub fn correct(k: Kf, z: KVec, zhat: KVec, h: Mat, r: Mat) -> Kf []
+    let inn = innovate_with(k, z, zhat, h, r)
+    if not inn.ok
+        return Kf { n: k.n, x: k.x, p: k.p, last: inn, fault: KF_SINGULAR_INNOVATION }
+    let hp = kfmat.mul(h, k.p)
+    let gain = kfmat.transpose(kfmat.solve_spd(inn.s, hp))
+    let x = kfmat.vadd(k.x, kfmat.mul_vec(gain, inn.y))
+    checked(Kf { n: k.n, x: x, p: joseph(k.p, gain, h, r), last: inn, fault: KF_OK })
+
+// The linear update with the measurement `z = H x + noise` of
+// covariance `r`.
+//
+// ```novo
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     let k = kalman.filter(kfmat.vec1(0.0), kfmat.diagonal(1, 4.0))
+//     let k2 = kalman.update(k, kfmat.vec1(5.0), kfmat.identity(1), kfmat.diagonal(1, 1.0))
+//     println("${kalman.state(k2).a[0]}")   // 4
+// ```
+pub fn update(k: Kf, z: KVec, h: Mat, r: Mat) -> Kf []
+    correct(k, z, kfmat.mul_vec(h, k.x), h, r)
+
+// The update with one measurement `z` of predicted value `zhat`, the
+// Jacobian row `h` and the variance `r`.  `S` is the number
+// `h P hᵀ + r`, the gain is `P hᵀ / S`, and the covariance takes the
+// Joseph form: no matrix is inverted.
+//
+// ```novo
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     let k = kalman.filter(kfmat.vec2(0.0, 0.0), kfmat.diagonal(2, 4.0))
+//     let k2 = kalman.correct_scalar(k, 5.0, 0.0, kfmat.vec2(1.0, 0.0), 1.0)
+//     println("${kalman.state(k2).a[0]}")   // 4
+// ```
+pub fn correct_scalar(k: Kf, z: fp32, zhat: fp32, h: KVec, r: fp32) -> Kf []
+    let inn = innovate_scalar_with(k, z, zhat, h, r)
+    if not inn.ok
+        return Kf { n: k.n, x: k.x, p: k.p, last: inn, fault: KF_SINGULAR_INNOVATION }
+    let one: fp32 = 1.0
+    let gain = kfmat.vscale(kfmat.mul_vec(k.p, h), one / inn.s.a[0])
+    let x = kfmat.vadd(k.x, kfmat.vscale(gain, inn.y.a[0]))
+    var rm = kfmat.zeros(1, 1)
+    rm.a[0] = r
+    let p = joseph(k.p, kfmat.column(gain), kfmat.row(h), rm)
+    checked(Kf { n: k.n, x: x, p: p, last: inn, fault: KF_OK })
+
+// The linear update with one measurement `z = h x + noise` of
+// variance `r`.
+//
+// ```novo
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     let k = kalman.filter(kfmat.vec2(0.0, 0.0), kfmat.diagonal(2, 4.0))
+//     let k2 = kalman.update_scalar(k, 5.0, kfmat.vec2(1.0, 0.0), 1.0)
+//     println("${kalman.state(k2).a[0]}")   // 4
+// ```
+pub fn update_scalar(k: Kf, z: fp32, h: KVec, r: fp32) -> Kf []
+    correct_scalar(k, z, kfmat.dot(h, k.x), h, r)
+
+// The linear update with a vector measurement whose components are
+// independent, as `m` scalar updates: component `i` has the row `i` of
+// `h` and the variance `r_diag[i]`.  Each update starts from the
+// estimate the one before it left, which is what makes the result
+// equal to the matrix update with `R = diag(r_diag)`.  An update that
+// is refused leaves its fault code in the answer, and the loop stops.
+//
+// ```novo
+// use kalman
+// use kfmat
+//
+// fn main() [io]
+//     let k = kalman.filter(kfmat.vec2(0.0, 0.0), kfmat.diagonal(2, 4.0))
+//     let k2 = kalman.update_each(k, kfmat.vec2(5.0, 10.0), kfmat.identity(2), kfmat.vec2(1.0, 1.0))
+//     println("${kalman.state(k2).a[0]} ${kalman.state(k2).a[1]}")   // 4 8
+// ```
+pub fn update_each(k: Kf, z: KVec, h: Mat, r_diag: KVec) -> Kf []
+    if h.r != z.n or r_diag.n != z.n
+        panic.panic("kalman.update_each: a dimension does not match the measurement")
+    var out = k
+    for i in 0..z.n
+        out = update_scalar(out, z.a[i], kfmat.row_of(h, i), r_diag.a[i])
+        if out.fault == KF_SINGULAR_INNOVATION
+            return out
+    out
