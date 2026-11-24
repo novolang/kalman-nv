@@ -145,9 +145,9 @@ from the `twist` of the `Odometer` that `odometry.update` answers, as `v` and
 `w`, and this package does not depend on it: a filter that fuses a twist needs
 no knowledge of how the twist was measured, and an odometer needs none of the
 filter. A program on a microcontroller replaces `math.sin` and `math.cos` with
-the single-precision ones of [ahrs-nv](https://novo-lang.org/packages/ahrs-nv)
-(`fpmath.sin`, `fpmath.cos`) or of odometry-nv (`odotrig`), since the embedded
-tier refuses a call into the host's maths library.
+the single-precision ones of [fpmath-nv](https://novo-lang.org/packages/fpmath-nv)
+(`fpmath.sin`, `fpmath.cos`), which ahrs-nv and odometry-nv take as well, since
+the embedded tier refuses a call into the host's maths library.
 
 Build and test with `novo pkg build` and `novo test`.
 

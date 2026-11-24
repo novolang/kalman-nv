@@ -1,6 +1,6 @@
 [package]
 name        = "kalman-nv"
-version     = "0.1.0"
+version     = "0.1.1"
 description = "A linear and an extended Kalman filter over matrices whose capacity is fixed at build time, in single precision and with no allocation: predict, the update with the Joseph form of the covariance, a symmetric and a positive-definite check, the innovation and its covariance exposed for gating, and a scalar update for uncorrelated measurements that takes no inverse at all."
 license     = "Apache-2.0"
 

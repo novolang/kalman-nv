@@ -5,6 +5,15 @@ All notable changes to kalman-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.1 — 2026-11-24
+
+### Changed
+
+- The README names fpmath-nv, which holds the single-precision sine and
+  cosine that ahrs-nv and odometry-nv each carried, as the source of the
+  functions a filter on a microcontroller takes in place of `math.sin` and
+  `math.cos`.  This package carries no copy of them and needs no change.
+
 ## 0.1.0 — 2026-11-23
 
 ### Added
